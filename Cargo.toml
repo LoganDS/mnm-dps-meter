@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2021"
 description = "OCR-based damage meter for Monsters & Memories"
 
+[features]
+default = []
+# Enable native screen capture via xcap (requires libxcb on Linux)
+xcap-capture = ["xcap"]
+# Enable Tesseract OCR via leptess library binding (requires leptonica + tesseract dev libs)
+leptess-ocr = ["leptess"]
+
 [dependencies]
 egui = "0.31"
 eframe = "0.31"
@@ -17,6 +24,10 @@ dirs = "6"
 thiserror = "2"
 anyhow = "1"
 image = "0.25"
+tempfile = "3"
+xcap = { version = "0.4", features = ["vendored"], optional = true }
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+leptess = { version = "0.6", optional = true }
 
 [dev-dependencies]
-tempfile = "3"

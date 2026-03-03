@@ -3,8 +3,10 @@
 //! Entry point: initializes tracing, loads config, and (in later tasks)
 //! launches the egui UI and OCR pipelines.
 
+mod capture;
 mod config;
 mod dedup;
+mod ocr;
 mod panel;
 mod parser;
 mod session;
