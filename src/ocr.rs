@@ -22,7 +22,7 @@ use tracing::debug;
 /// Requires Tesseract and Leptonica system libraries to be installed.
 /// On Linux: `apt install tesseract-ocr libleptonica-dev`
 /// On macOS: `brew install tesseract`
-#[cfg(feature = "leptess-ocr")]
+#[cfg(feature = "tesseract")]
 pub struct TesseractOcr {
     /// Optional path to tessdata directory. None uses system default.
     data_path: Option<String>,
@@ -30,7 +30,7 @@ pub struct TesseractOcr {
     lang: String,
 }
 
-#[cfg(feature = "leptess-ocr")]
+#[cfg(feature = "tesseract")]
 impl TesseractOcr {
     /// Create a new Tesseract OCR engine with default settings.
     ///
@@ -96,7 +96,7 @@ impl TesseractOcr {
     }
 }
 
-#[cfg(feature = "leptess-ocr")]
+#[cfg(feature = "tesseract")]
 impl OcrEngine for TesseractOcr {
     fn ocr_image(&self, image: &DynamicImage) -> Result<String> {
         let data_path = self.data_path.as_deref();

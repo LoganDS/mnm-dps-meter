@@ -310,12 +310,12 @@ impl MiniPanelPipeline {
 /// Returns an error message with platform-specific guidance if the
 /// engine is unavailable or misconfigured.
 pub fn run_ocr_health_check() -> Result<(), String> {
-    #[cfg(feature = "leptess-ocr")]
+    #[cfg(feature = "tesseract")]
     {
         let ocr = crate::ocr::TesseractOcr::new();
         return ocr.health_check().map_err(|e| e.to_string());
     }
-    #[cfg(not(feature = "leptess-ocr"))]
+    #[cfg(not(feature = "tesseract"))]
     {
         let ocr = TesseractCliOcr::new();
         ocr.health_check().map_err(|e| e.to_string())
@@ -327,11 +327,11 @@ pub fn run_ocr_health_check() -> Result<(), String> {
 /// Prefers `leptess` (Tesseract library binding) when the feature is enabled,
 /// falling back to the Tesseract CLI wrapper.
 pub fn create_ocr_engine() -> Box<dyn OcrEngine> {
-    #[cfg(feature = "leptess-ocr")]
+    #[cfg(feature = "tesseract")]
     {
         return Box::new(crate::ocr::TesseractOcr::new());
     }
-    #[cfg(not(feature = "leptess-ocr"))]
+    #[cfg(not(feature = "tesseract"))]
     {
         Box::new(TesseractCliOcr::new())
     }

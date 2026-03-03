@@ -3,13 +3,16 @@ name = "mnm-dps-meter"
 version = "0.1.0"
 edition = "2021"
 description = "OCR-based damage meter for Monsters & Memories"
+license = "MIT"
 
 [features]
 default = []
 # Enable native screen capture via xcap (requires libxcb on Linux)
 xcap-capture = ["xcap"]
-# Enable Tesseract OCR via leptess library binding (requires leptonica + tesseract dev libs)
-leptess-ocr = ["leptess"]
+# Enable Tesseract OCR backend (requires system tesseract + leptonica libraries)
+tesseract = ["leptess"]
+# Enable Windows WinRT OCR backend (Windows only, placeholder)
+# winrt-ocr = ["windows"]
 
 [dependencies]
 egui = "0.31"
@@ -27,7 +30,17 @@ image = "0.25"
 tempfile = "3"
 xcap = { version = "0.4", features = ["vendored"], optional = true }
 
-[target.'cfg(not(target_os = "windows"))'.dependencies]
+# OCR backend — optional, requires system libraries
 leptess = { version = "0.6", optional = true }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+# WinRT OCR API — placeholder for future implementation
+# windows = { version = "0.58", optional = true, features = ["Media_Ocr", "Graphics_Imaging", "Storage_Streams"] }
+
 [dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
