@@ -2,16 +2,23 @@
 //!
 //! Implements the egui/eframe application shell with control bar,
 //! scrolling event log, statistics panels, and region selection.
-//! Manual coordinate entry is the primary (reliable) region selection method.
-//! Drag-select overlay is the secondary (best-effort) method.
+//! Receives pipeline messages via mpsc channel and updates the session
+//! accumulator in real-time. Manual coordinate entry is the primary
+//! (reliable) region selection method. Drag-select overlay is the
+//! secondary (best-effort) method.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::Arc;
 
 use eframe::egui;
 use tracing::warn;
 
 use crate::config::AppConfig;
 use crate::overlay::{OverlayState, RegionTarget};
+use crate::pipeline::{self, PipelineHandle};
 use crate::session::SharedSession;
-use crate::types::{CaptureRegion, SessionStatus};
+use crate::types::{CaptureRegion, PipelineMessage, SessionStatus};
 
 /// Action produced by the manual entry dialog.
 enum DialogAction {
@@ -106,8 +113,8 @@ impl RegionEntryDialog {
 
 /// Main application struct implementing [`eframe::App`].
 ///
-/// Holds a shared reference to the session state (for pipeline thread
-/// communication) and the user's persisted config, plus overlay/dialog state.
+/// Holds a shared reference to the session state, pipeline communication
+/// channels, pipeline thread handles, and the user's persisted config.
 pub struct DamageMeterApp {
     /// Thread-safe shared session state.
     session: SharedSession,
@@ -121,11 +128,36 @@ pub struct DamageMeterApp {
     overlay: Option<OverlayState>,
     /// Active manual entry dialog (if open).
     region_dialog: Option<RegionEntryDialog>,
+
+    // --- Pipeline integration ---
+
+    /// Receives messages from pipeline threads.
+    receiver: mpsc::Receiver<PipelineMessage>,
+    /// Sender clone for spawning new pipeline threads.
+    sender: mpsc::Sender<PipelineMessage>,
+    /// Shared pause flag checked by pipeline threads.
+    paused: Arc<AtomicBool>,
+    /// Handle to the combat log pipeline thread, if running.
+    combat_pipeline: Option<PipelineHandle>,
+    /// Handle to the mini panel pipeline thread, if running.
+    mini_panel_pipeline: Option<PipelineHandle>,
+    /// Startup error message (OCR health check failure, etc.).
+    startup_error: Option<String>,
 }
 
 impl DamageMeterApp {
-    /// Create a new application instance.
-    pub fn new(session: SharedSession, config: AppConfig) -> Self {
+    /// Create a new application instance with pipeline infrastructure.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        session: SharedSession,
+        config: AppConfig,
+        receiver: mpsc::Receiver<PipelineMessage>,
+        sender: mpsc::Sender<PipelineMessage>,
+        paused: Arc<AtomicBool>,
+        combat_pipeline: Option<PipelineHandle>,
+        mini_panel_pipeline: Option<PipelineHandle>,
+        startup_error: Option<String>,
+    ) -> Self {
         let character_name_buf = config.character_name.clone().unwrap_or_default();
         Self {
             session,
@@ -134,10 +166,16 @@ impl DamageMeterApp {
             auto_scroll: true,
             overlay: None,
             region_dialog: None,
+            receiver,
+            sender,
+            paused,
+            combat_pipeline,
+            mini_panel_pipeline,
+            startup_error,
         }
     }
 
-    /// Apply a selected region to config and persist.
+    /// Apply a selected region to config, persist, and restart the relevant pipeline.
     fn apply_region(&mut self, target: RegionTarget, region: CaptureRegion) {
         match target {
             RegionTarget::CombatLog => {
@@ -149,6 +187,80 @@ impl DamageMeterApp {
         }
         if let Err(e) = self.config.save() {
             warn!("Failed to save config: {}", e);
+        }
+        // Restart the relevant pipeline thread with the new region
+        match target {
+            RegionTarget::CombatLog => self.restart_combat_pipeline(),
+            RegionTarget::MiniPanel => self.restart_mini_panel_pipeline(),
+        }
+    }
+
+    /// Stop the combat log pipeline (if running) and spawn a new one.
+    fn restart_combat_pipeline(&mut self) {
+        if let Some(ref handle) = self.combat_pipeline {
+            handle.signal_stop();
+        }
+        self.combat_pipeline = None;
+
+        if let Some(region) = self.config.combat_log_region {
+            match pipeline::spawn_combat_log_pipeline(
+                region,
+                self.config.combat_capture_interval_ms,
+                self.config.character_name.clone(),
+                self.sender.clone(),
+                Arc::clone(&self.paused),
+            ) {
+                Ok(handle) => {
+                    self.combat_pipeline = Some(handle);
+                }
+                Err(e) => {
+                    warn!("Failed to start combat log pipeline: {}", e);
+                }
+            }
+        }
+    }
+
+    /// Stop the mini panel pipeline (if running) and spawn a new one.
+    fn restart_mini_panel_pipeline(&mut self) {
+        if let Some(ref handle) = self.mini_panel_pipeline {
+            handle.signal_stop();
+        }
+        self.mini_panel_pipeline = None;
+
+        if let Some(region) = self.config.mini_panel_region {
+            match pipeline::spawn_mini_panel_pipeline(
+                region,
+                self.config.panel_capture_interval_ms,
+                self.sender.clone(),
+                Arc::clone(&self.paused),
+            ) {
+                Ok(handle) => {
+                    self.mini_panel_pipeline = Some(handle);
+                }
+                Err(e) => {
+                    warn!("Failed to start mini panel pipeline: {}", e);
+                }
+            }
+        }
+    }
+
+    /// Drain all pending messages from the pipeline receiver and update session state.
+    fn drain_pipeline_messages(&self) {
+        while let Ok(msg) = self.receiver.try_recv() {
+            let mut session = self.session.lock().unwrap();
+            match msg {
+                PipelineMessage::DamageEvents(events) => {
+                    for event in events {
+                        session.add_damage_event(event);
+                    }
+                }
+                PipelineMessage::ManaUpdate(stats) => {
+                    session.update_vitals(stats);
+                }
+                PipelineMessage::ManaTick(tick) => {
+                    session.add_mana_tick(tick);
+                }
+            }
         }
     }
 
@@ -300,6 +412,7 @@ impl DamageMeterApp {
                 .clicked()
             {
                 self.session.lock().unwrap().pause();
+                self.paused.store(true, Ordering::Relaxed);
             }
 
             if ui
@@ -307,6 +420,7 @@ impl DamageMeterApp {
                 .clicked()
             {
                 self.session.lock().unwrap().resume();
+                self.paused.store(false, Ordering::Relaxed);
             }
 
             if ui.button("Clear").clicked() {
@@ -458,8 +572,23 @@ impl DamageMeterApp {
     }
 }
 
+impl Drop for DamageMeterApp {
+    fn drop(&mut self) {
+        // Signal all pipeline threads to shut down
+        if let Some(ref handle) = self.combat_pipeline {
+            handle.signal_stop();
+        }
+        if let Some(ref handle) = self.mini_panel_pipeline {
+            handle.signal_stop();
+        }
+    }
+}
+
 impl eframe::App for DamageMeterApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Drain all pending pipeline messages and update session state
+        self.drain_pipeline_messages();
+
         // Check for overlay completion
         let overlay_result = if let Some(ref overlay) = self.overlay {
             if overlay.done {
@@ -493,6 +622,23 @@ impl eframe::App for DamageMeterApp {
             });
         });
 
+        // Startup error banner (OCR health check failure, etc.)
+        if let Some(ref error) = self.startup_error {
+            egui::TopBottomPanel::top("error_banner").show(ctx, |ui| {
+                ui.colored_label(
+                    egui::Color32::RED,
+                    format!("OCR unavailable: {}", error),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "Capture pipelines are disabled. Fix the issue and restart the app.",
+                    )
+                    .small()
+                    .weak(),
+                );
+            });
+        }
+
         // Control bar
         egui::TopBottomPanel::top("control_bar").show(ctx, |ui| {
             self.render_control_bar(ui);
@@ -525,6 +671,21 @@ impl eframe::App for DamageMeterApp {
 mod tests {
     use super::*;
     use crate::session::new_shared_session;
+
+    /// Helper: create a DamageMeterApp with dummy pipeline infrastructure for testing.
+    fn test_app(session: SharedSession, config: AppConfig) -> DamageMeterApp {
+        let (sender, receiver) = mpsc::channel();
+        DamageMeterApp::new(
+            session,
+            config,
+            receiver,
+            sender,
+            Arc::new(AtomicBool::new(false)),
+            None,
+            None,
+            None,
+        )
+    }
 
     #[test]
     fn test_region_entry_validation_valid() {
@@ -679,9 +840,10 @@ mod tests {
     fn test_app_creation() {
         let config = AppConfig::default();
         let session = new_shared_session();
-        let app = DamageMeterApp::new(session, config);
+        let app = test_app(session, config);
         assert!(app.overlay.is_none());
         assert!(app.region_dialog.is_none());
+        assert!(app.startup_error.is_none());
     }
 
     #[test]
@@ -694,7 +856,7 @@ mod tests {
         if let Some(ref name) = config.character_name {
             session.lock().unwrap().character_name = Some(name.clone());
         }
-        let app = DamageMeterApp::new(session, config);
+        let app = test_app(session, config);
         let session = app.session.lock().unwrap();
         assert_eq!(session.character_name, Some("Narky".to_string()));
     }
@@ -712,7 +874,7 @@ mod tests {
             ..Default::default()
         };
         let session = new_shared_session();
-        let app = DamageMeterApp::new(session, config);
+        let app = test_app(session, config);
         assert_eq!(app.get_region(RegionTarget::CombatLog), Some(region));
         assert_eq!(app.get_region(RegionTarget::MiniPanel), None);
     }
@@ -730,8 +892,82 @@ mod tests {
             ..Default::default()
         };
         let session = new_shared_session();
-        let app = DamageMeterApp::new(session, config);
+        let app = test_app(session, config);
         assert_eq!(app.get_region(RegionTarget::MiniPanel), Some(region));
         assert_eq!(app.get_region(RegionTarget::CombatLog), None);
+    }
+
+    #[test]
+    fn test_drain_pipeline_messages() {
+        let session = new_shared_session();
+        let (sender, receiver) = mpsc::channel();
+        let app = DamageMeterApp::new(
+            Arc::clone(&session),
+            AppConfig::default(),
+            receiver,
+            sender.clone(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            None,
+            None,
+        );
+
+        // Send a damage event batch
+        use crate::types::DamageEvent;
+        use std::time::Instant;
+        let event = DamageEvent {
+            id: 1,
+            timestamp: Instant::now(),
+            source_player: "Narky".to_string(),
+            attack_name: "pierce".to_string(),
+            target: "a cultist".to_string(),
+            damage_value: 7,
+            damage_element: None,
+            raw_line: "Narky pierces a cultist for 7 points of damage.".to_string(),
+        };
+        sender
+            .send(PipelineMessage::DamageEvents(vec![event]))
+            .unwrap();
+
+        // Send a vitals update
+        use crate::types::VitalStats;
+        sender
+            .send(PipelineMessage::ManaUpdate(VitalStats {
+                hp_current: Some(442),
+                hp_max: Some(454),
+                mana_current: Some(185),
+                mana_max: Some(470),
+                endurance_current: None,
+                endurance_max: None,
+            }))
+            .unwrap();
+
+        // Drain and verify
+        app.drain_pipeline_messages();
+
+        let session = session.lock().unwrap();
+        assert_eq!(session.total_damage, 7);
+        assert_eq!(session.damage_events.len(), 1);
+        assert_eq!(session.current_mana, Some(185));
+        assert_eq!(session.current_hp, Some(442));
+    }
+
+    #[test]
+    fn test_app_with_startup_error() {
+        let (sender, receiver) = mpsc::channel();
+        let app = DamageMeterApp::new(
+            new_shared_session(),
+            AppConfig::default(),
+            receiver,
+            sender,
+            Arc::new(AtomicBool::new(false)),
+            None,
+            None,
+            Some("Tesseract not found".to_string()),
+        );
+        assert_eq!(
+            app.startup_error.as_deref(),
+            Some("Tesseract not found")
+        );
     }
 }
