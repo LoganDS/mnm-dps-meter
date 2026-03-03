@@ -1,15 +1,17 @@
 //! mnm-dps-meter — OCR-based damage meter for Monsters & Memories.
 //!
-//! Entry point: initializes tracing, loads config, and (in later tasks)
-//! launches the egui UI and OCR pipelines.
+//! Entry point: initializes tracing, loads config, and launches the
+//! egui/eframe UI with region selection and session display.
 
 mod config;
 mod dedup;
+mod overlay;
 mod panel;
 mod parser;
 mod session;
 mod tick;
 mod types;
+mod ui;
 
 use config::AppConfig;
 use tracing::info;
@@ -34,6 +36,18 @@ fn main() -> anyhow::Result<()> {
         info!("Mini panel region configured");
     }
 
-    info!("mnm-dps-meter initialized (UI not yet implemented)");
+    let options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_inner_size([800.0, 600.0]),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "Damage Meter (OCR)",
+        options,
+        Box::new(|_cc| Ok(Box::new(ui::DamageMeterApp::new(config)))),
+    )
+    .map_err(|e| anyhow::anyhow!("eframe error: {}", e))?;
+
     Ok(())
 }
