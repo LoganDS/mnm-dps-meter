@@ -4,6 +4,7 @@
 //! launches the egui UI and OCR pipelines.
 
 mod config;
+mod parser;
 mod session;
 mod types;
 
