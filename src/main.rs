@@ -4,8 +4,11 @@
 //! launches the egui UI and OCR pipelines.
 
 mod config;
+mod dedup;
+mod panel;
 mod parser;
 mod session;
+mod tick;
 mod types;
 
 use config::AppConfig;
