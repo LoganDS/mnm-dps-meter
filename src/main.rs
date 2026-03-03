@@ -7,6 +7,7 @@ mod capture;
 mod config;
 mod dedup;
 mod ocr;
+mod overlay;
 mod panel;
 mod parser;
 mod session;
